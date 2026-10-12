@@ -136,7 +136,9 @@ def verify_mfa_challenge(mfa_token: str, code: str, request: HttpRequest) -> Use
     payload = _load_mfa_token(mfa_token)
     with transaction.atomic():
         challenge = (
-            MFAChallenge.objects.select_for_update()
+            # Lock only the challenge row: Postgres rejects FOR UPDATE on the
+            # nullable side of the LEFT JOIN to tenant (platform admins).
+            MFAChallenge.objects.select_for_update(of=("self",))
             .select_related("user", "user__tenant")
             .filter(pk=payload["cid"], user_id=payload["uid"])
             .first()
