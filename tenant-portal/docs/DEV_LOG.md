@@ -569,3 +569,105 @@ Same as before (Phase 1 and Phase 2 exit checks), now run locally:
    `platform_admin`, with `is_email_verified=True` and no tenant.
 
 No files change, except this log (and a code fix only if a check fails).
+
+---
+
+## Fix: `POST /api/auth/mfa/verify/` returned 500 (2026-10-11)
+
+### Problem
+Every MFA verify call returned **500**. PostgreSQL log:
+`FOR UPDATE cannot be applied to the nullable side of an outer join`.
+
+`verify_mfa_challenge` used `select_for_update()` together with
+`select_related("user", "user__tenant")`. `tenant` is nullable, so Django
+uses a `LEFT OUTER JOIN`, and a bare `select_for_update()` tries to lock
+**every** joined table. PostgreSQL refuses to lock the nullable side of a
+LEFT JOIN. Platform admins (the only users with MFA) have no tenant, so the
+query always failed.
+
+### Change
+- **Changed** `src/accounts/services/mfa.py`:
+  `select_for_update()` → `select_for_update(of=("self",))`.
+  SQL becomes `FOR UPDATE OF "accounts_mfachallenge"`: only the challenge
+  row is locked. That is the row we update (attempts, consumed_at), so the
+  attempt limit and the "one code accepted once" rule still hold.
+
+### Result
+- The query was run against the local PostgreSQL (port 5433): no error,
+  SQL ends with `FOR UPDATE OF "accounts_mfachallenge"`.
+
+### How to test it yourself
+1. `POST /api/auth/login/` with the platform admin → copy `mfa_token`.
+2. `POST /api/auth/mfa/verify/` with `{"mfa_token": "...", "code": "123456"}`
+   (fresh code from the authenticator app) → expect **200** with `access`.
+3. Wrong code → **401** `mfa_code_invalid` (no more 500).
+
+---
+
+## Test setup: Google sign-in (2026-10-11)
+
+### Why
+Google sign-in starts with a browser redirect and ends on a **frontend**
+callback page, so it cannot be tested from Swagger alone. There is no
+frontend yet, so two small test pages act as the frontend on
+`http://localhost:3000` (kept outside the repo).
+
+- `index.html`: gets the CSRF cookie (`GET /_allauth/browser/v1/config`), then
+  sends a form POST to `/_allauth/browser/v1/auth/provider/redirect`
+  (`provider=google`, `process=login`, `callback_url=.../callback.html`).
+- `callback.html`: shows `?error=<code>` if allauth refused the login,
+  otherwise calls `POST /api/auth/google/exchange/`, then offers
+  `GET /api/auth/me/` and `POST /api/auth/onboarding/`.
+
+### Prerequisites
+- Google Cloud Console OAuth client (Web), redirect URI
+  `http://localhost:8000/accounts/google/login/callback/`; consent screen in
+  *Testing* with your Gmail added as a test user.
+- Backend on **`localhost:8000`** (not `127.0.0.1`): cookies are shared
+  between `localhost:3000` and `localhost:8000`, not with `127.0.0.1`.
+
+### Test plan
+| # | Scenario | Expected |
+|---|---|---|
+| 1 | New Gmail signs in | exchange 200; `me` = tenant_admin, no tenant |
+| 2 | Onboarding | 201 with `tenant_id`; again → 409 |
+| 3 | Same Google account again | 200, tenant already set |
+| 4 | Gmail already used by an email/password account | `?error=email_already_registered` |
+| 5 | Exchange twice | second → 401 (single use) |
+| 6 | Exchange without `X-Requested-With` | 403 |
+
+---
+
+## Fix: Google exchange always returned 401 (2026-10-11)
+
+### Problem
+The Google login itself worked (user and `SocialAccount` created), but
+`POST /api/auth/google/exchange/` always answered
+**401 "No Google login to exchange."**
+
+`exchange_google_session` used `request.user`. The view is a
+`PublicAPIView` (`authentication_classes = []`), so DRF sets the user to
+`AnonymousUser` and also writes it onto the underlying Django request
+(`rest_framework/request.py`, `Request.user` setter:
+`self._request.user = value`). The user that Django had loaded from the
+allauth session was lost before our code ran.
+
+### Change
+- **Changed** `src/accounts/services/google.py`: `user = request.user` →
+  `user = get_user(request)` (`django.contrib.auth.get_user`, reads the user
+  from the session with Django's normal checks). The other rules are
+  unchanged: Google login less than 5 minutes old, session destroyed after
+  the exchange.
+
+### Result (Django test client, inside a rolled-back transaction)
+- Simulated fresh Google session → exchange **200** with `access_token`.
+- Second exchange → **401** (single use).
+- No `X-Requested-With` header → **403**.
+
+### How to test it yourself
+Open `http://localhost:3000/index.html`, sign in with Google again (the
+failed attempt destroyed the old session) → callback shows
+`Exchange -> HTTP 200`. Then **GET /api/auth/me/** and **Onboarding**.
+
+Note: the test page `callback.html` read `access` instead of
+`access_token`; fixed in the copy in `D:\google-test\google-test`.
