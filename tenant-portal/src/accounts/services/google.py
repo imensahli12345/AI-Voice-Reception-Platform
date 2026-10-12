@@ -4,6 +4,7 @@ import time
 
 from allauth.account.authentication import get_authentication_records
 from django.conf import settings
+from django.contrib.auth import get_user
 from django.contrib.auth import logout as django_logout
 from django.http import HttpRequest
 
@@ -23,7 +24,9 @@ def exchange_google_session(request: HttpRequest) -> tuple[User, TokenPair]:
     The allauth session is destroyed immediately, so it is single use and
     the rest of the API only ever sees JWTs.
     """
-    user = request.user
+    # Read from the session: DRF has already replaced request.user with
+    # AnonymousUser, because the exchange view has no authentication classes.
+    user = get_user(request)
     records = get_authentication_records(request)
     last = records[-1] if records else {}
     is_recent_google = (
