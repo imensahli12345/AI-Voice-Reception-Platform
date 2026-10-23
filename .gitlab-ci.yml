@@ -1,0 +1,24 @@
+# Root (parent) pipeline.
+# Each service has its own child pipeline, started only when its files change.
+
+stages:
+  - services
+
+# One pipeline per change: merge request pipelines when an MR is open,
+# branch pipelines otherwise (avoids running everything twice).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+tenant-portal:
+  stage: services
+  trigger:
+    include: tenant-portal/.gitlab-ci.yml
+    strategy: depend   # this job (and the parent) fails if the child fails
+  rules:
+    - changes:
+        - tenant-portal/**/*
+        - .gitlab-ci.yml
