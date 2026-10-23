@@ -19,3 +19,7 @@ venv/
 Thumbs.db
 
 .env.local
+
+# Local test reports (CI keeps its own copies as artifacts)
+reports/
+.coverage
