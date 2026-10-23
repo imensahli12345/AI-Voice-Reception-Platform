@@ -671,3 +671,103 @@ failed attempt destroyed the old session) → callback shows
 
 Note: the test page `callback.html` read `access` instead of
 `access_token`; fixed in the copy in `D:\google-test\google-test`.
+
+---
+
+## CI step 2.1: first automated tests (2026-10-23)
+
+### Goal
+The auth service had no tests. Before writing the GitLab CI, add 4 simple
+tests that cover the ISO/IEC 25010 quality characteristics and run them for
+real (no simulated results).
+
+### Changes
+- **Changed** `requirements-dev.txt`: added `pytest-cov==7.1.0`, `ruff==0.17.2`,
+  `bandit==1.9.4` (pinned).
+- **New** `src/.coveragerc`: coverage counts application code only
+  (tests, migrations and settings are excluded, so the % is honest).
+- **New** `src/accounts/tests/test_unit_passwords_tokens.py` — test (a), unit:
+  Argon2 hash + verify, valid / expired / tampered JWT.
+- **New** `src/accounts/tests/test_api_auth_flow.py` — test (b), API:
+  register → verify email (link read from the test mailbox) → login → `/api/auth/me/`
+  = 200; wrong password = 401; no token = 401.
+- **New** `src/accounts/tests/test_roles.py` — test (c), roles: a tenant_admin gets
+  200 on `/api/tenant/me/` but 403 on `/api/admin/tenants/`.
+- Test (d), SAST, is Bandit: no test file, it scans `src/`.
+- **Changed** `.gitignore`: ignore local `reports/` and `.coverage`.
+
+The database is PostgreSQL (the same as production). SQLite is not used anywhere.
+
+### Real results (run inside the dev Docker image, Python 3.12.14, Postgres 16)
+- pytest: **8 passed** in 8.96 s. Coverage of application code: **69 %**
+  (1213 statements, 374 missed).
+- Bandit (`--severity-level medium`): **no medium/high issues**, exit code 0.
+  8 low-severity notes, all false positives (strings such as `'token_refresh'`
+  or `'Bearer'` next to a variable name containing "token"/"password").
+- Ruff (classic error rules E4, E7, E9, F): 2 findings, both E402 in
+  `config/settings/dev.py` (intentional: `.env.local` must be loaded before
+  the base settings are imported). To be handled in step 2.2.
+
+### How to test it yourself
+```bash
+cd tenant-portal
+docker compose build portal
+docker compose up -d db
+docker compose run --rm -e RUN_MIGRATIONS=false portal pytest -v --cov --cov-report=term
+docker compose run --rm --no-deps --entrypoint "" portal bandit -r . -x ./accounts/tests,./audit/tests,./accounts/migrations,./audit/migrations --severity-level medium
+```
+
+---
+
+## CI step 2.2: GitLab CI pipeline (2026-10-23)
+
+### Goal
+Run lint, the 4 tests and the Bandit scan automatically in GitLab, only when
+the tenant-portal changes, with reports visible in GitLab and kept as proof.
+
+### Changes
+- **New** `.gitlab-ci.yml` (repository root, parent pipeline): job `tenant-portal`
+  uses `trigger: include: tenant-portal/.gitlab-ci.yml` + `strategy: depend`, with
+  `rules: changes: [tenant-portal/**/*, .gitlab-ci.yml]`. A `workflow` block avoids
+  running a branch pipeline and an MR pipeline for the same push.
+- **New** `tenant-portal/.gitlab-ci.yml` (child pipeline), stages lint → test → security:
+  - `ruff` — lint, JUnit report `reports/ruff-junit.xml`.
+  - `pytest` — tests (a), (b), (c) against a throwaway `pgvector/pgvector:pg16`
+    service (alias `db`). JUnit `reports/report.xml`, Cobertura `reports/coverage.xml`,
+    coverage % read from the `TOTAL` line of the log.
+  - `bandit` — test (d). Full JSON report, JUnit XML of medium/high findings,
+    and the job fails on any medium/high finding.
+  - All reports are saved as artifacts for 30 days, even when a job fails.
+  - Tool versions are read from `requirements-dev.txt` (one place to change them).
+- **New** `src/ruff.toml`: ruff's classic error rules (E4, E7, E9, F).
+- **Changed** `src/config/settings/dev.py`: `# noqa: E402` on the two imports that
+  must come after `read_env()` (intentional order), plus a comment explaining why.
+
+### CI variable to create in GitLab
+`TEST_DB_PASSWORD` (Settings → CI/CD → Variables): letters and digits, 16+ chars,
+**Masked**, **not Protected** (otherwise it is empty on the `imen-dev` branch).
+If it is missing, the pytest job stops with a clear error message.
+
+### Local check (real run)
+Each job's script was run exactly as written in the YAML, in a clean
+`python:3.12-slim` container, with Postgres as a separate container named `db`
+(a stand-in for a GitLab runner; the real proof is the GitLab run):
+- ruff: `All checks passed!`, exit 0
+- pytest: `8 passed in 10.10s`, `TOTAL 1213 374 69%`, coverage regex reads `69%`, exit 0
+- bandit: `No issues identified.`, exit 0
+- Missing `TEST_DB_PASSWORD` → job stops with the error message, exit 1.
+
+Note: with no findings, `bandit-junit.xml` contains 0 test cases, so Bandit adds
+nothing to the Tests tab when the code is clean. The proof is the job log and
+`bandit-report.json`.
+
+---
+
+## CI step 2.3: testing documentation (2026-10-23)
+
+- **New** `TESTING.md`: traceability table (requirement | test | tool |
+  ISO 25010 characteristic | how to see the result), where to find the
+  results in GitLab, the required CI variable, how to run the tests locally,
+  and the latest real local results.
+- **Changed** `.gitlab-ci.yml` (child): comment on the `lint` stage now says
+  "code quality check" (coverage is measured in the `pytest` job, not in lint).
